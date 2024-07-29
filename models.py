@@ -9,8 +9,6 @@ import cv2
 from utils import get_image_file_paths, display_image, pad_image, normalize_array
 import os
 import logging
-import sys
-sys.path.append('/nfs/home/wldn1677/lgd')
 from Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2
 logging.basicConfig(level=logging.INFO)
 
