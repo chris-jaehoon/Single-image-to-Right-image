@@ -3,52 +3,194 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-# import paddlehub as hub
+import paddlehub as hub
 from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
 import cv2
 from utils import get_image_file_paths, display_image, pad_image, normalize_array
 import os
 import logging
-import sys
-sys.path.append('/nfs/home/wldn1677/lgd')
 from Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2
 logging.basicConfig(level=logging.INFO)
 
 
-class ImageToTextModel:
-    def __init__(self) -> None:
-        self.device = th.device("cuda") if th.cuda.is_available() else th.device("cpu")
-        self.text_model = VisionEncoderDecoderModel.from_pretrained(
-            "nlpconnect/vit-gpt2-image-captioning"
-        )
-        self.text_feature_extractor = ViTImageProcessor.from_pretrained(
-            "nlpconnect/vit-gpt2-image-captioning"
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "nlpconnect/vit-gpt2-image-captioning"
-        )
-        self.text_model.to(self.device)
+class GatedConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, activation=F.elu):
+        super(GatedConv, self).__init__()
+        self.activation = activation
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=dilation, dilation=dilation)
+        self.gate = nn.Conv2d(in_channels, out_channels, kernel_size, padding=dilation, dilation=dilation)
 
-    def describe_image(self, image: Image.Image) -> str:
-        """
-        Describe image using text model.
+    def forward(self, x):
+        conv = self.conv(x)
+        gate = th.sigmoid(self.gate(x))
+        return self.activation(conv) * gate
 
+class ContextualAttention(nn.Module):
+    def forward(self, f, b, mask):
+        """ Contextual attention layer implementation
         Args:
-            image: PIL image
+            f: Input feature to match (foreground).
+            b: Input feature for match (background).
+            mask: Input mask for the foreground.
         Returns:
-            text: String
+            tf.Tensor: output tensor.
         """
-        kwargs = {"max_length": 400, "num_beams": 1}
+        # For simplicity, this example uses a placeholder implementation.
+        # You would replace this with the actual contextual attention logic.
+        return f, None
 
-        pixel_values = self.text_feature_extractor(
-            images=[image], return_tensors="pt"
-        ).pixel_values
-        pixel_values = pixel_values.to(self.device)
-        output_ids = self.text_model.generate(pixel_values, **kwargs)
+class InpaintCAModel(nn.Module):
+    def __init__(self):
+        super(InpaintCAModel, self).__init__()
 
-        labels = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        labels = [label.strip() for label in labels]
-        return labels[0]
+        self.stage1 = nn.Sequential(
+            GatedConv(5, 48, 5, 1),
+            GatedConv(48, 48, 3, 1),
+            GatedConv(48, 96, 3, 2),
+            GatedConv(96, 96, 3, 1),
+            GatedConv(96, 192, 3, 1),
+            GatedConv(192, 192, 3, 2),
+            GatedConv(192, 192, 3, 4),
+            GatedConv(192, 192, 3, 8),
+            GatedConv(192, 192, 3, 16),
+            GatedConv(192, 192, 3, 1),
+            GatedConv(192, 192, 3, 1)
+        )
+
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.stage1_upsample = nn.Sequential(
+            GatedConv(192, 96, 3, 1),
+            GatedConv(96, 96, 3, 1)
+        )
+
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.stage1_final = nn.Sequential(
+            GatedConv(96, 48, 3, 1),
+            GatedConv(48, 24, 3, 1),
+            GatedConv(24, 4, 3, 1)
+        )
+
+        self.stage2_conv = nn.Sequential(
+            GatedConv(4, 48, 5, 1),
+            GatedConv(48, 48, 3, 1),
+            GatedConv(48, 96, 3, 2),
+            GatedConv(96, 96, 3, 1),
+            GatedConv(96, 192, 3, 1),
+            GatedConv(192, 192, 3, 2),
+            GatedConv(192, 192, 3, 4),
+            GatedConv(192, 192, 3, 8),
+            GatedConv(192, 192, 3, 16)
+        )
+
+        self.attention_branch = nn.Sequential(
+            GatedConv(4, 48, 5, 1),
+            GatedConv(48, 48, 3, 2),
+            GatedConv(48, 96, 3, 1),
+            GatedConv(96, 192, 3, 2),
+            GatedConv(192, 192, 3, 1),
+            GatedConv(192, 192, 3, 1)
+        )
+
+        self.contextual_attention = ContextualAttention()
+
+        self.stage2_final = nn.Sequential(
+            GatedConv(384, 192, 3, 1),
+            GatedConv(192, 192, 3, 1),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            GatedConv(192, 96, 3, 1),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            GatedConv(96, 48, 3, 1),
+            GatedConv(48, 24, 3, 1),
+            GatedConv(24, 3, 3, 1)
+        )
+
+    def forward(self, x, mask):
+        xin = x
+        ones_x = th.ones_like(x)[:, :1, :, :]
+        x = th.cat([x, ones_x, ones_x * mask], dim=1)
+
+        # Stage 1
+        x = self.stage1(x)
+        x = self.upsample1(x)
+        x = self.stage1_upsample(x)
+        x = self.upsample2(x)
+        x_stage1 = self.stage1_final(x)
+
+        # Stage 2
+        x = x_stage1 * mask + xin[:, :3, :, :] * (1. - mask)
+        x = self.stage2_conv(x)
+
+        x_attention = self.attention_branch(xin)
+        x_attention, offset_flow = self.contextual_attention(x_attention, x_attention, mask)
+
+        x = th.cat([x, x_attention], dim=1)
+        x = self.stage2_final(x)
+        x_stage2 = th.tanh(x)
+
+        return x_stage2
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.conv = nn.Sequential(
+            dis_conv(3, 64, 3, 1),
+            dis_conv(64, 128, 3, 1),
+            dis_conv(128, 256, 3, 1),
+            dis_conv(256, 512, 3, 1),
+            dis_conv(512, 512, 3, 1),
+            dis_conv(512, 512, 3, 1)
+        )
+        self.flatten = nn.Flatten()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.flatten(x)
+        return x
+
+
+# Helper function for dis_conv
+def dis_conv(in_channels, out_channels, kernel_size, stride):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=1),
+        nn.LeakyReLU(0.2, inplace=True)
+    )
+
+
+# class ImageToTextModel:
+#     def __init__(self) -> None:
+#         self.device = th.device("cuda") if th.cuda.is_available() else th.device("cpu")
+#         self.text_model = VisionEncoderDecoderModel.from_pretrained(
+#             "nlpconnect/vit-gpt2-image-captioning"
+#         )
+#         self.text_feature_extractor = ViTImageProcessor.from_pretrained(
+#             "nlpconnect/vit-gpt2-image-captioning"
+#         )
+#         self.tokenizer = AutoTokenizer.from_pretrained(
+#             "nlpconnect/vit-gpt2-image-captioning"
+#         )
+#         self.text_model.to(self.device)
+
+#     def describe_image(self, image: Image.Image) -> str:
+#         """
+#         Describe image using text model.
+
+#         Args:
+#             image: PIL image
+#         Returns:
+#             text: String
+#         """
+#         kwargs = {"max_length": 400, "num_beams": 1}
+
+#         pixel_values = self.text_feature_extractor(
+#             images=[image], return_tensors="pt"
+#         ).pixel_values
+#         pixel_values = pixel_values.to(self.device)
+#         output_ids = self.text_model.generate(pixel_values, **kwargs)
+
+#         labels = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+#         labels = [label.strip() for label in labels]
+#         return labels[0]
 
 
 class ImageCompletionModel:
@@ -58,8 +200,8 @@ class ImageCompletionModel:
 
     def __init__(self) -> None:
         self.device = th.device("cuda") if th.cuda.is_available() else th.device("cpu")
-        model_path = "runwayml/stable-diffusion-inpainting"
-        self.image_completion_model = 
+        #model_path = "need to 학습~  ㅜ"
+        self.image_completion_model = InpaintCAModel().to(self.device)
         
         
         # self.image_completion_model = StableDiffusionInpaintPipeline.from_pretrained(
@@ -68,7 +210,7 @@ class ImageCompletionModel:
         #     torch_dtype=th.float16,
         # ).to(self.device)
 
-        self.image_to_text_model = ImageToTextModel()
+    #     self.image_to_text_model = ImageToTextModel()
 
     def inpaint(self, image: Image.Image, mask: np.ndarray) -> Image.Image:
         """
@@ -127,15 +269,15 @@ class ImageCompletionModel:
             np.clip(np.sqrt(mask) * 1000, 0, 255).astype(np.uint8)
         ).resize((512, 512))
 
-        outpaint_prompt = self.image_to_text_model.describe_image(input_image)
-        print(outpaint_prompt)
+       # outpaint_prompt = self.image_to_text_model.describe_image(input_image)
+     #   print(outpaint_prompt)
 
         guidance_scale = 7.5
         num_samples = 1
         generator = th.Generator(device=self.device).manual_seed(1)
 
         model_output = self.image_completion_model(
-            prompt=outpaint_prompt,
+            #prompt=outpaint_prompt,
             image=padded_image,
             mask_image=mask,
             guidance_scale=guidance_scale,
@@ -284,159 +426,17 @@ if __name__ == "__main__":
     depth_map = monocular_depth_model.get_depth_map(image)
     display_image(depth_map)
 
-class GatedConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation, activation=F.elu):
-        super(GatedConv, self).__init__()
-        self.activation = activation
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=dilation, dilation=dilation)
-        self.gate = nn.Conv2d(in_channels, out_channels, kernel_size, padding=dilation, dilation=dilation)
-
-    def forward(self, x):
-        conv = self.conv(x)
-        gate = torch.sigmoid(self.gate(x))
-        return self.activation(conv) * gate
-
-class ContextualAttention(nn.Module):
-    def forward(self, f, b, mask):
-        """ Contextual attention layer implementation
-        Args:
-            f: Input feature to match (foreground).
-            b: Input feature for match (background).
-            mask: Input mask for the foreground.
-        Returns:
-            tf.Tensor: output tensor.
-        """
-        # For simplicity, this example uses a placeholder implementation.
-        # You would replace this with the actual contextual attention logic.
-        return f, None
-
-class InpaintCAModel(nn.Module):
-    def __init__(self):
-        super(InpaintCAModel, self).__init__()
-
-        self.stage1 = nn.Sequential(
-            GatedConv(5, 48, 5, 1),
-            GatedConv(48, 48, 3, 1),
-            GatedConv(48, 96, 3, 2),
-            GatedConv(96, 96, 3, 1),
-            GatedConv(96, 192, 3, 1),
-            GatedConv(192, 192, 3, 2),
-            GatedConv(192, 192, 3, 4),
-            GatedConv(192, 192, 3, 8),
-            GatedConv(192, 192, 3, 16),
-            GatedConv(192, 192, 3, 1),
-            GatedConv(192, 192, 3, 1)
-        )
-
-        self.upsample1 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.stage1_upsample = nn.Sequential(
-            GatedConv(192, 96, 3, 1),
-            GatedConv(96, 96, 3, 1)
-        )
-
-        self.upsample2 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.stage1_final = nn.Sequential(
-            GatedConv(96, 48, 3, 1),
-            GatedConv(48, 24, 3, 1),
-            GatedConv(24, 4, 3, 1)
-        )
-
-        self.stage2_conv = nn.Sequential(
-            GatedConv(4, 48, 5, 1),
-            GatedConv(48, 48, 3, 1),
-            GatedConv(48, 96, 3, 2),
-            GatedConv(96, 96, 3, 1),
-            GatedConv(96, 192, 3, 1),
-            GatedConv(192, 192, 3, 2),
-            GatedConv(192, 192, 3, 4),
-            GatedConv(192, 192, 3, 8),
-            GatedConv(192, 192, 3, 16)
-        )
-
-        self.attention_branch = nn.Sequential(
-            GatedConv(4, 48, 5, 1),
-            GatedConv(48, 48, 3, 2),
-            GatedConv(48, 96, 3, 1),
-            GatedConv(96, 192, 3, 2),
-            GatedConv(192, 192, 3, 1),
-            GatedConv(192, 192, 3, 1)
-        )
-
-        self.contextual_attention = ContextualAttention()
-
-        self.stage2_final = nn.Sequential(
-            GatedConv(384, 192, 3, 1),
-            GatedConv(192, 192, 3, 1),
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            GatedConv(192, 96, 3, 1),
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            GatedConv(96, 48, 3, 1),
-            GatedConv(48, 24, 3, 1),
-            GatedConv(24, 3, 3, 1)
-        )
-
-    def forward(self, x, mask):
-        xin = x
-        ones_x = torch.ones_like(x)[:, :1, :, :]
-        x = torch.cat([x, ones_x, ones_x * mask], dim=1)
-
-        # Stage 1
-        x = self.stage1(x)
-        x = self.upsample1(x)
-        x = self.stage1_upsample(x)
-        x = self.upsample2(x)
-        x_stage1 = self.stage1_final(x)
-
-        # Stage 2
-        x = x_stage1 * mask + xin[:, :3, :, :] * (1. - mask)
-        x = self.stage2_conv(x)
-
-        x_attention = self.attention_branch(xin)
-        x_attention, offset_flow = self.contextual_attention(x_attention, x_attention, mask)
-
-        x = torch.cat([x, x_attention], dim=1)
-        x = self.stage2_final(x)
-        x_stage2 = torch.tanh(x)
-
-        return x_stage1, x_stage2, offset_flow
-
-
-class Discriminator(nn.Module):
-    def __init__(self):
-        super(Discriminator, self).__init__()
-        self.conv = nn.Sequential(
-            dis_conv(3, 64, 3, 1),
-            dis_conv(64, 128, 3, 1),
-            dis_conv(128, 256, 3, 1),
-            dis_conv(256, 512, 3, 1),
-            dis_conv(512, 512, 3, 1),
-            dis_conv(512, 512, 3, 1)
-        )
-        self.flatten = nn.Flatten()
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.flatten(x)
-        return x
-
-
-# Helper function for dis_conv
-def dis_conv(in_channels, out_channels, kernel_size, stride):
-    return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding=1),
-        nn.LeakyReLU(0.2, inplace=True)
-    )
 
 # Example usage
-if __name__ == '__main__':
-    inpaint_model = InpaintCAModel()
-    discriminator = Discriminator()
-    x = torch.randn(4, 3, 256, 256)
-    mask = torch.randn(4, 1, 256, 256)
+# if __name__ == '__main__':
+#     inpaint_model = InpaintCAModel()
+#     discriminator = Discriminator()
+#     x = torch.randn(4, 3, 256, 256)
+#     mask = torch.randn(4, 1, 256, 256)
 
-    x_stage1, x_stage2, offset_flow = inpaint_model(x, mask)
-    disc_out = discriminator(x_stage2)
+#     x_stage1, x_stage2, offset_flow = inpaint_model(x, mask)
+#     disc_out = discriminator(x_stage2)
 
-    print(f'x_stage1 shape: {x_stage1.shape}')
-    print(f'x_stage2 shape: {x_stage2.shape}')
-    print(f'disc_out shape: {disc_out.shape}')
+#     print(f'x_stage1 shape: {x_stage1.shape}')
+#     print(f'x_stage2 shape: {x_stage2.shape}')
+#     print(f'disc_out shape: {disc_out.shape}')
