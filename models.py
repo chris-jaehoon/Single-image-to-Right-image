@@ -308,7 +308,7 @@ class MattingModel:
             alpha_matte: Numpy array
         """
         logging.info("Generating alpha matte.")
-
+        
         image = np.asarray(image)
         alpha_matte = self.matting_model.Segmentation(
             images=[image],
@@ -337,7 +337,7 @@ class MonocularDepthModel:
         encoder = 'vits' # or 'vits', 'vitb', 'vitg'
         self.device = th.device("cuda") if th.cuda.is_available() else th.device("cpu")
         self.model = DepthAnythingV2(**model_configs[encoder])
-        self.model.load_state_dict(th.load(f'/nfs/home/wldn1677/lgd/Single-image-to-Right-image/ckpts/depth_anything_v2_{encoder}.pth', map_location='cpu'))
+        self.model.load_state_dict(th.load(f'/Single-image-to-Right-image/ckpts/depth_anything_v2_{encoder}.pth', map_location='cpu'))
         self.model.to(self.device)
         self.model.eval()
         # model_type = "DPT_Large"
